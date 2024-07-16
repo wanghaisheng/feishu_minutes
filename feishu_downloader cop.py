@@ -1,8 +1,12 @@
 import configparser, locale, os, re, subprocess, time, asyncio
 import aiohttp
 from tqdm import tqdm
+
 from loguru import logger
+
+import os, json
 from dp_helper import DPHelper
+
 
 locale.setlocale(locale.LC_CTYPE, "chinese")
 
@@ -50,16 +54,14 @@ print(f"Proxies: {proxy_address}")
 homeurl = 'https://home.feishu.cn/admin/index'
 
 class FeishuDownloader:
-    def __init__(self, cookie=None, save_path=None,json_cookie_path=None):
+    def __init__(self, cookie=None,json_cookie_path=None):
         self.headers = None
-        self.save_path=save_path
         self.cookie = cookie
         self.csrf_token = None
-        self.json_cookie_path = json_cookie_path if json_cookie_path else "./download-cookie.json"
+        self.json_cookie_path = json_cookie_path
+
         self.meeting_time_dict = {}
         self.subtitle_type = 'srt' if subtitle_params['format'] == 3 else 'txt'
-        self.download_semaphore = asyncio.Semaphore(5)  # Allow up to 5 concurrent downloads
-        self.session = None
 
     async def auto_cookie(self):
         if not self.cookie:
@@ -77,7 +79,7 @@ class FeishuDownloader:
 
                 self.browser = DPHelper(browser_path=None, HEADLESS=False)
 
-                self.cookie = self.browser.getCookie(homeurl, json_cookie_path=self.json_cookie_path)
+                self.cookie = self.browser.getCookie(homeurl,json_cookie_path=self.json_cookie_path)
         print('check cookie is ok')
         if not self.cookie:
             print('get cookie failed')
@@ -114,11 +116,12 @@ class FeishuDownloader:
         批量获取妙记信息
         """
         get_rec_url = f'https://meetings.feishu.cn/minutes/api/space/list?&size={list_size}&space_name={space_name}'
-        async with self.session.get(url=get_rec_url, headers=self.headers, proxy=proxy_address) as resp:
-            data = await resp.json()
-            if 'list' not in data['data']:
-                raise Exception("minutes_cookie失效，请重新获取！")
-            return list(reversed(data['data']['list']))
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url=get_rec_url, headers=self.headers, proxy=proxy_address) as resp:
+                data = await resp.json()
+                if 'list' not in data['data']:
+                    raise Exception("minutes_cookie失效，请重新获取！")
+                return list(reversed(data['data']['list']))
 
     async def check_minutes(self):
         """
@@ -148,8 +151,9 @@ class FeishuDownloader:
         """
         使用aria2批量下载妙记
         """
-        tasks = [self.get_minutes_url(minutes) for minutes in minutes_list]
-        results = await asyncio.gather(*tasks)
+        async with aiohttp.ClientSession() as session:
+            tasks = [self.get_minutes_url(session, minutes) for minutes in minutes_list]
+            results = await asyncio.gather(*tasks)
 
         with open('links.temp', 'w', encoding='utf-8') as file:
             for video_url, file_name in results:
@@ -171,43 +175,42 @@ class FeishuDownloader:
             os.utime(f'{save_path}/{file_name}/{file_name}.{self.subtitle_type}', (start_time, start_time))
         self.meeting_time_dict = {}
 
-    async def get_minutes_url(self, minutes):
+    async def get_minutes_url(self, session, minutes):
         """
         获取妙记视频下载链接；写入字幕文件。
         """
-        async with self.download_semaphore:
-            video_url_url = f'https://meetings.feishu.cn/minutes/api/status?object_token={minutes["object_token"]}&language=zh_cn&_t={int(time.time() * 1000)}'
-            async with self.session.get(url=video_url_url, headers=self.headers, proxy=proxy_address) as resp:
-                data = await resp.json()
-                video_url = data['data']['video_info']['video_download_url']
+        video_url_url = f'https://meetings.feishu.cn/minutes/api/status?object_token={minutes["object_token"]}&language=zh_cn&_t={int(time.time() * 1000)}'
+        async with session.get(url=video_url_url, headers=self.headers, proxy=proxy_address) as resp:
+            data = await resp.json()
+            video_url = data['data']['video_info']['video_download_url']
 
-            subtitle_url = f'https://meetings.feishu.cn/minutes/api/export'
-            params = subtitle_params.copy()
-            params['object_token'] = minutes['object_token']
-            async with self.session.post(url=subtitle_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
-                subtitle_text = await resp.text()
+        subtitle_url = f'https://meetings.feishu.cn/minutes/api/export'
+        params = subtitle_params.copy()
+        params['object_token'] = minutes['object_token']
+        async with session.post(url=subtitle_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
+            subtitle_text = await resp.text()
 
-            file_name = re.sub(r'[\/\\\:\*\?\"\<\>\|]', '_', minutes['topic'])
+        file_name = re.sub(r'[\/\\\:\*\?\"\<\>\|]', '_', minutes['topic'])
+        
+        if minutes['object_type'] == 0:
+            start_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['start_time'] / 1000))
+            stop_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['stop_time'] / 1000))
+            file_name = start_time + "至" + stop_time + file_name
+        else:
+            create_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['create_time'] / 1000))
+            file_name = create_time + file_name
+        
+        subtitle_name = file_name
             
-            if minutes['object_type'] == 0:
-                start_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['start_time'] / 1000))
-                stop_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['stop_time'] / 1000))
-                file_name = start_time + "至" + stop_time + file_name
-            else:
-                create_time = time.strftime("%Y年%m月%d日%H时%M分", time.localtime(minutes['create_time'] / 1000))
-                file_name = create_time + file_name
-            
-            subtitle_name = file_name
-                
-            os.makedirs(f'{save_path}/{file_name}', exist_ok=True)
+        os.makedirs(f'{save_path}/{file_name}', exist_ok=True)
 
-            with open(f'{save_path}/{file_name}/{subtitle_name}.{self.subtitle_type}', 'w', encoding='utf-8') as f:
-                f.write(subtitle_text)
-            
-            if minutes['object_type'] == 0:
-                self.meeting_time_dict[file_name] = minutes['start_time']/1000
+        with open(f'{save_path}/{file_name}/{subtitle_name}.{self.subtitle_type}', 'w', encoding='utf-8') as f:
+            f.write(subtitle_text)
+        
+        if minutes['object_type'] == 0:
+            self.meeting_time_dict[file_name] = minutes['start_time']/1000
 
-            return video_url, file_name
+        return video_url, file_name
 
     async def delete_minutes(self, num):
         """
@@ -215,65 +218,66 @@ class FeishuDownloader:
         """
         all_minutes = await self.get_minutes()
 
-        for index in tqdm(all_minutes[:num], desc='删除妙记'):
-            try:
-                delete_url = f'https://meetings.feishu.cn/minutes/api/space/delete'
-                params = {'object_tokens': index['object_token'],
-                        'is_destroyed': 'false',
-                        'language': 'zh_cn'}
-                async with self.session.post(url=delete_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"删除妙记 http://meetings.feishu.cn/minutes/{index['object_token']} 失败！{await resp.json()}")
+        async with aiohttp.ClientSession() as session:
+            for index in tqdm(all_minutes[:num], desc='删除妙记'):
+                try:
+                    delete_url = f'https://meetings.feishu.cn/minutes/api/space/delete'
+                    params = {'object_tokens': index['object_token'],
+                            'is_destroyed': 'false',
+                            'language': 'zh_cn'}
+                    async with session.post(url=delete_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"删除妙记 http://meetings.feishu.cn/minutes/{index['object_token']} 失败！{await resp.json()}")
 
-                params['is_destroyed'] = 'true'
-                async with self.session.post(url=delete_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"删除妙记 http://meetings.feishu.cn/minutes/{index['object_token']} 失败！{await resp.json()}")
-            except Exception as e:
-                print(f"{e} 可能是没有该妙记的权限。")
-                num += 1
-                continue
+                    params['is_destroyed'] = 'true'
+                    async with session.post(url=delete_url, params=params, headers=self.headers, proxy=proxy_address) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"删除妙记 http://meetings.feishu.cn/minutes/{index['object_token']} 失败！{await resp.json()}")
+                except Exception as e:
+                    print(f"{e} 可能是没有该妙记的权限。")
+                    num += 1
+                    continue
 
-async def main(downloader):
-    # downloader = FeishuDownloader(json_cookie_path='./download-cookie.json')
+async def main():
+    downloader = FeishuDownloader(json_cookie_path='./download-cookie.json')
 
     await downloader.auto_cookie()
 
     if not minutes_cookie:
         raise Exception("cookie不能为空！")
     
-    async with aiohttp.ClientSession() as session:
-        downloader.session = session
+    elif not manager_cookie:
+        while True:
+            print(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()))
+            if await downloader.check_minutes():
+                await downloader.delete_minutes(1)
+            await asyncio.sleep(check_interval)
 
-        if not manager_cookie:
-            while True:
-                print(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()))
-                if await downloader.check_minutes():
-                    await downloader.delete_minutes(1)
-                await asyncio.sleep(check_interval)
+    else:
+        x_csrf_token = manager_cookie[manager_cookie.find(' csrf_token=') + len(' csrf_token='):manager_cookie.find(';', manager_cookie.find(' csrf_token='))]
+        if len(x_csrf_token) != 36:
+            raise Exception("manager_cookie中不包含csrf_token，请确保从请求`count?_t=`中获取！")
 
-        else:
-            x_csrf_token = manager_cookie[manager_cookie.find(' csrf_token=') + len(' csrf_token='):manager_cookie.find(';', manager_cookie.find(' csrf_token='))]
-            if len(x_csrf_token) != 36:
-                raise Exception("manager_cookie中不包含csrf_token，请确保从请求`count?_t=`中获取！")
-
-            usage_bytes_old = 0
-            while True:
-                print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-                query_url = f'https://www.feishu.cn/suite/admin/api/gaea/usages'
-                manager_headers = {'cookie': manager_cookie, 'X-Csrf-Token': x_csrf_token}
+        usage_bytes_old = 0
+        while True:
+            print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            query_url = f'https://www.feishu.cn/suite/admin/api/gaea/usages'
+            manager_headers = {'cookie': manager_cookie, 'X-Csrf-Token': x_csrf_token}
+            async with aiohttp.ClientSession() as session:
                 async with session.get(url=query_url, headers=manager_headers, proxy=proxy_address) as resp:
                     data = await resp.json()
                     usage_bytes = int(data['data']['items'][6]['usage'])
-                print(f"已用空间：{usage_bytes / 2 ** 30:.2f}GB")
-                if usage_bytes != usage_bytes_old:
-                    await downloader.check_minutes()
-                    if usage_bytes > 2 ** 30 * usage_threshold:
-                        await downloader.delete_minutes(2)
-                else:
-                    print(f"等待{check_interval}s后再次检查...")
-                usage_bytes_old = usage_bytes
-                
-                await asyncio.sleep(check_interval)
+            print(f"已用空间：{usage_bytes / 2 ** 30:.2f}GB")
+            if usage_bytes != usage_bytes_old:
+                downloader = FeishuDownloader(minutes_cookie)
+                await downloader.check_minutes()
+                if usage_bytes > 2 ** 30 * usage_threshold:
+                    await downloader.delete_minutes(2)
+            else:
+                print(f"等待{check_interval}s后再次检查...")
+            usage_bytes_old = usage_bytes
+            
+            await asyncio.sleep(check_interval)
 
-# if __name_
+if __name__ == '__main__':
+    asyncio.run(main())

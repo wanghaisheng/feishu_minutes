@@ -8,6 +8,7 @@ import os, json
 from dp_helper import DPHelper
 
 import json
+semaphore = asyncio.Semaphore(100)  # Allow up to 50 concurrent tasks
 
 # 假设JSON配置文件名为 'config.json'
 json_file_path = 'config.json'
@@ -43,19 +44,14 @@ print(f"File Path: {file_path}")
 print(f"Proxies: {proxies}")
 
 homeurl = 'https://meetings.feishu.cn/minutes/home'
+semaphore = asyncio.Semaphore(20)  # Allow up to 5 concurrent tasks
 
 class FeishuUploader:
-    def __init__(self, cookie=None, folder=None, json_cookie_path=None):
-        # ... (previous initialization code remains the same)
-        self.video_semaphore = asyncio.Semaphore(2)  # Allow up to 5 concurrent video uploads
-        self.block_semaphore = asyncio.Semaphore(20)  # Allow up to 20 concurrent block uploads per video
-
-        self.upload_complete_semaphore = asyncio.Semaphore(2)  # 确保只有一个完成上传的过程
-        
+    def __init__(self, cookie=None, folder=None,json_cookie_path=None):
         self.folder = folder
         self.file_path = file_path
         self.block_size = 2**20*4
-        self.json_cookie_path = json_cookie_path if json_cookie_path else "./upload-cookie.json"
+        self.json_cookie_path = json_cookie_path
         self.cookie = cookie
         self.upload_token = None
         self.headers = None
@@ -65,6 +61,7 @@ class FeishuUploader:
         self.file_header = None
         self.csrf_token = None
         self.session = None
+
     async def auto_cookie(self):
         if not self.cookie:
             print('there is no cookie provided')
@@ -113,8 +110,7 @@ class FeishuUploader:
             cookstr += k + "=" + v + "; "
         return cookstr
 
-    async def get_quota(self,file_path):
-        self.file_path=file_path
+    async def get_quota(self):
         if not os.path.exists(self.file_path) or os.path.getsize(self.file_path) == 0:
             print('this video not found or broken')
             return
@@ -139,11 +135,9 @@ class FeishuUploader:
             self.upload_token = quota_res['data']['upload_token'][file_info]
             return True
 
-    async def prepare_upload(self,file_path,downloaded_minutes):
-        self.file_path=file_path
-
+    async def prepare_upload(self):
         print('=====start to detect quota==========')
-        if not await self.get_quota(file_path):
+        if not await self.get_quota():
             print('please manually delete some files to release space')
             return
    
@@ -165,125 +159,104 @@ class FeishuUploader:
         self.vhid = prepare_res['data']['vhid']
         self.upload_id = prepare_res['data']['upload_id']
         self.object_token = prepare_res['data']['object_token']
-        if self.object_token in downloaded_minutes:
-            print(f'curent video token:{self.object_token}-{downloaded_minutes}')
-            return False
-        else:
-            return True
 
     async def upload_one_block(self, upload_url, data, block_index):
-        async with self.block_semaphore:  # Use the block semaphore here
-            retries = 3
-            for attempt in range(1, retries + 1):
-                try:
-                    async with self.session.post(upload_url, proxy=proxies, headers=self.headers, data=data) as response:
-                        if response.status == 200:
-                            if await response.text():
-                                logger.info(f"Task {self.file_path} completed on attempt {attempt}. Data: {block_index}")
-                                return True
-                        else:
-                            print(f"Task {block_index} failed on attempt {attempt}.{proxies} Status code: {response.status}")
-                except aiohttp.ClientConnectionError:
-                    if attempt < retries:
-                        print(f"Task {block_index} failed on attempt {attempt}.{proxies} Retrying...")
+        retries = 3
+        for attempt in range(1, retries + 1):
+            try:
+                async with self.session.post(upload_url, proxy=proxies, headers=self.headers, data=data) as response:
+                    if response.status == 200:
+                        if await response.text():
+                            logger.info(f"Task {self.file_path} completed on attempt {attempt}. Data: {block_index}")
+                            return True
                     else:
-                        print(f"Task {block_index} failed on all {retries} attempts. Skipping.")
-                except Exception:
-                    if attempt < retries:
-                        print(f"Task {block_index} failed on attempt {attempt}. Retrying...")
-                    else:
-                        print(f"Task {block_index} failed on all {retries} attempts. Skipping.")
+                        print(f"Task {block_index} failed on attempt {attempt}.{proxies} Status code: {response.status}")
+            except aiohttp.ClientConnectionError:
+                if attempt < retries:
+                    print(f"Task {block_index} failed on attempt {attempt}.{proxies} Retrying...")
+                else:
+                    print(f"Task {block_index} failed on all {retries} attempts. Skipping.")
+            except Exception:
+                if attempt < retries:
+                    print(f"Task {block_index} failed on attempt {attempt}. Retrying...")
+                else:
+                    print(f"Task {block_index} failed on all {retries} attempts. Skipping.")
 
-    async def upload_blocks(self,file_path):
-        self.file_path=file_path
-
+    async def upload_blocks(self):
         with open(self.file_path, 'rb') as f:
             f.seek(0)
             block_count = (self.file_size + self.block_size - 1) // self.block_size
-            tasks = []
-            with tqdm(total=block_count, unit='block') as progress_bar:
-                for i in range(block_count):
-                    block_data = f.read(self.block_size)
-                    block_size = len(block_data)
-                    checksum = zlib.adler32(block_data) & 0xffffffff
-                    upload_url = f'https://internal-api-space.feishu.cn/space/api/box/stream/upload/block?upload_id={self.upload_id}&seq={i}&size={block_size}&checksum={checksum}'
+            async with semaphore:
+                tasks = []
+                with tqdm(total=block_count, unit='block') as progress_bar:
+                    for i in range(block_count):
+                        block_data = f.read(self.block_size)
+                        block_size = len(block_data)
+                        checksum = zlib.adler32(block_data) & 0xffffffff
+                        upload_url = f'https://internal-api-space.feishu.cn/space/api/box/stream/upload/block?upload_id={self.upload_id}&seq={i}&size={block_size}&checksum={checksum}'
 
-                    task = asyncio.create_task(self.upload_one_block(upload_url=upload_url, data=block_data, block_index=i))
-                    tasks.append(task)
+                        task = asyncio.create_task(self.upload_one_block(upload_url=upload_url, data=block_data, block_index=i))
+                        tasks.append(task)
 
-                # 等待所有块上传任务完成
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await asyncio.gather(*tasks)
 
-                # 检查是否有上传失败的块
-                for result in results:
-                    if isinstance(result, Exception):
-                        # 处理异常，例如重试或记录错误
-                        print(f'video upload failed:{self.file_path}')
-                        return
-    
-                    if result:
-                        progress_bar.update(1)
+                    for r in results:
+                        if r:
+                            progress_bar.update(1)
 
-    async def complete_upload(self,file_path):
-        self.file_path=file_path
+    async def complete_upload(self):
+        complete_url1 = f'https://internal-api-space.feishu.cn/space/api/box/upload/finish/'
+        json_data = {
+            'upload_id': self.upload_id,
+            'num_blocks': (self.file_size + self.block_size - 1) // self.block_size,
+            'vhid': self.vhid,
+            'risk_detection_extra': '{\"source_terminal\":1,\"file_operate_usage\":3,\"locale\":\"zh_cn\"}'
+        }
+        async with self.session.post(complete_url1, headers=self.headers, proxy=proxies, json=json_data) as response:
+            resp = await response.json()
+        print(resp)
 
-        async with self.upload_complete_semaphore:  # Use the block semaphore here
+        complete_url2 = f'https://meetings.feishu.cn/minutes/api/upload/finish'
+        json_data = {
+            'auto_transcribe': True,
+            'language': 'mixed',
+            'num_blocks': (self.file_size + self.block_size - 1) // self.block_size,
+            'upload_id': self.upload_id,
+            'vhid': self.vhid,
+            'upload_token': self.upload_token,
+            'object_token': self.object_token,
+        }
+        async with self.session.post(complete_url2, headers=self.headers, proxy=proxies, json=json_data) as response:
+            resp = await response.json()
+        print(resp)
 
-            complete_url1 = f'https://internal-api-space.feishu.cn/space/api/box/upload/finish/'
-            json_data = {
-                'upload_id': self.upload_id,
-                'num_blocks': (self.file_size + self.block_size - 1) // self.block_size,
-                'vhid': self.vhid,
-                'risk_detection_extra': '{\"source_terminal\":1,\"file_operate_usage\":3,\"locale\":\"zh_cn\"}'
-            }
-            async with self.session.post(complete_url1, headers=self.headers, proxy=proxies, json=json_data) as response:
-                resp = await response.json()
-            print(resp)
+        # Check if transcription is complete after upload
+        start_time = time.time()
+        while True:
+            await asyncio.sleep(3)
+            object_status_url = f'https://meetings.feishu.cn/minutes/api/batch-status?object_token[]={self.object_token}&language=zh_cn'
+            async with self.session.get(object_status_url, headers=self.headers, proxy=proxies) as response:
+                object_status = await response.json()
+            transcript_progress = object_status['data']['status'][0]['transcript_progress']
+            spend_time = time.time() - start_time
+            if object_status['data']['status'][0]['object_status'] == 2 or transcript_progress['current'] == '':
+                print(f"\n转写完成！用时{spend_time}\nhttp://meetings.feishu.cn/minutes/{object_status['data']['status'][0]['object_token']}")
+                break
+            print(f"转写中...已用时{spend_time}\r", end='')
 
-            complete_url2 = f'https://meetings.feishu.cn/minutes/api/upload/finish'
-            json_data = {
-                'auto_transcribe': True,
-                'language': 'mixed',
-                'num_blocks': (self.file_size + self.block_size - 1) // self.block_size,
-                'upload_id': self.upload_id,
-                'vhid': self.vhid,
-                'upload_token': self.upload_token,
-                'object_token': self.object_token,
-            }
-            async with self.session.post(complete_url2, headers=self.headers, proxy=proxies, json=json_data) as response:
-                resp = await response.json()
-            with open('upload-minutes.txt', 'a') as f:
-                f.write(self.object_token+'\n')
-            # Check if transcription is complete after upload
-            start_time = time.time()
-            while True:
-                await asyncio.sleep(3)
-                object_status_url = f'https://meetings.feishu.cn/minutes/api/batch-status?object_token[]={self.object_token}&language=zh_cn'
-                async with self.session.get(object_status_url, headers=self.headers, proxy=proxies) as response:
-                    object_status = await response.json()
-                transcript_progress = object_status['data']['status'][0]['transcript_progress']
-                spend_time = time.time() - start_time
-                if object_status['data']['status'][0]['object_status'] == 2 or transcript_progress['current'] == '':
-                    print(f"\n转写完成！用时{spend_time}\nhttp://meetings.feishu.cn/minutes/{object_status['data']['status'][0]['object_token']}")
-                    break
-                print(f"转写中...已用时{spend_time}\r", end='')
-
-    async def do_one(self,file_path,downloaded_minutes):
-        self.file_path=file_path
-
-        async with self.video_semaphore:  # Use the video semaphore here
-            retries = 3
+    async def do_one(self):
+        retries = 3
+        async with semaphore:
             for i in range(retries):
                 try:
+
+
                     print(f'start to preparing video:{self.file_path}')
-                    isddone=await self.prepare_upload(file_path,downloaded_minutes)
-                    if not isddone:
-                        print(f'this video uploaded before:{self.file_path}')
-                        break
+                    await self.prepare_upload()
                     print(f'start to uploading video:{self.file_path}')
-                    await self.upload_blocks(file_path)
+                    await self.upload_blocks()
                     print(f'start to completing video:{self.file_path}')
-                    await self.complete_upload(file_path)
+                    await self.complete_upload()
                     break  # If successful, exit the loop
                 except Exception as e:
                     print(f"Connection error on attempt {i+1}: {e}")
@@ -301,30 +274,22 @@ class FeishuUploader:
         print('start to detect video files')
         tasks = []
         self.filetype = '.mp4'
-        downloaded_minutes = set()
-        if os.path.exists('upload-minutes.txt'):
-            with open('upload-minutes.txt', 'r') as f:
-                downloaded_minutes = set(line.strip() for line in f)
-        
-
-        async with aiohttp.ClientSession() as self.session:
+        self.session=aiohttp.ClientSession()
+        async with   self.session:
             for root, dirs, files in os.walk(self.folder):
                 video_files = [file for file in files if file.endswith(self.filetype)]
-                video_files=list(set(video_files))
+
                 if video_files:
                     print('=====start to detect cookie======')
+
                     await self.auto_cookie()
                     
-                    for file in video_files[:10]:
-                        file_path = os.path.join(root, file)
-                        # self.json_cookie_path = './cookie.json'
-                        print(f'start to processing video:{file_path}')
+                    for file in video_files[:2]:
+                        self.file_path = os.path.join(root, file)
+                        self.json_cookie_path = './cookie.json'
+                        print(f'start to processing video:{self.file_path}')
 
-                        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-                            print('this video not found or broken')
-                            return
-
-                        task = asyncio.create_task(self.do_one(file_path=file_path,downloaded_minutes=downloaded_minutes))
+                        task = asyncio.create_task(self.do_one())
                         tasks.append(task)
 
                     await asyncio.gather(*tasks)
@@ -332,9 +297,9 @@ class FeishuUploader:
                     print(f'there is no video under folder:{self.folder}')
 
 # Example usage:
-async def main():
-    uploader = FeishuUploader(cookie=minutes_cookie, folder=file_path)
-    await uploader.upload()
+# async def main():
+#     uploader = FeishuUploader(cookie=minutes_cookie, folder='path/to/video/folder')
+#     await uploader.upload()
 
-if __name__ == '__main__':
-    asyncio.run(main())
+# if __name__ == '__main__':
+#     asyncio.run(main())

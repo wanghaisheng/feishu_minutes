@@ -1,0 +1,24 @@
+{
+    "Cookies": {
+      "minutes_cookie": "your_minutes_cookie_value_here",
+      "manager_cookie": "your_manager_cookie_value_here"
+    },
+    "下载设置": {
+      "所在空间": 1,
+      "每次检查的妙记数量": 10,
+      "检查妙记的时间间隔（单位s，太短容易报错）": 600,
+      "文件类型": 1,
+      "是否只下载字幕文件（是/否）": "否",
+      "妙记额度删除阈值（GB，填写了manager_cookie才有效）": 5.0,
+      "保存路径（不填则默认为当前路径/data）": "./downloads",
+      "字幕参数": {
+        "字幕是否包含说话人（是/否）": "是",
+        "字幕是否包含时间戳（是/否）": "是",
+        "字幕格式（srt/txt）": "srt"
+      }
+    },
+    "代理设置": {
+      "是否使用代理（是/否）": "否",
+      "代理地址": "http://your_proxy_address:port"
+    }
+  }
